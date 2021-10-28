@@ -1,0 +1,2622 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+new file mode 100644
+index 0000000..fbf4170
+--- /dev/null
++++ b/.vscode/settings.json
+@@ -0,0 +1,5 @@
++{
++    "files.associations": {
++        "*.s": "c"
++    }
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 328f9c6..2918593 100644
+--- a/Makefile
++++ b/Makefile
+@@ -29,7 +29,7 @@ OBJS = \
+   $K/kernelvec.o \
+   $K/plic.o \
+   $K/virtio_disk.o
+-
++ 
+ # riscv64-unknown-elf- or riscv64-linux-gnu-
+ # perhaps in /opt/riscv/bin
+ #TOOLPREFIX = 
+@@ -87,7 +87,7 @@ $U/initcode: $U/initcode.S
+ tags: $(OBJS) _init
+ 	etags *.S *.c
+ 
+-ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o
++ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o $U/Csemaphore.o
+ 
+ _%: %.o $(ULIB)
+ 	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
+@@ -132,6 +132,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_test\
++	$U/_bsem_test\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -153,7 +155,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 41098f4..c32e64b 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -8,6 +8,8 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct sigaction; 
++
+ 
+ // bio.c
+ void            binit(void);
+@@ -89,7 +91,7 @@ int             growproc(int);
+ void            proc_mapstacks(pagetable_t);
+ pagetable_t     proc_pagetable(struct proc *);
+ void            proc_freepagetable(pagetable_t, uint64);
+-int             kill(int);
++int             kill (int pid, int signum);
+ struct cpu*     mycpu(void);
+ struct cpu*     getmycpu(void);
+ struct proc*    myproc();
+@@ -105,7 +107,21 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
+-
++//added q2 
++uint sigprocmask (uint sigmask);        // proc mask
++int sigaction (int signum, const struct sigaction *act, struct sigaction *oldact);
++void sigret (void);
++//added Q4
++int             bsem_alloc(void);
++void            bsem_free(int);
++void            bsem_down(int);
++void            bsem_up(int);
++/*struct thread*  mythread(void);             //added to Q3 
++int             alloctid();
++int             kthread_create ( void ( *start_func ) ( ) , void *stack ) ;
++int             kthread_id();
++void            kthread_exit(int status);
++int             kthread_join(int thread_id, int* status);*/
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+ 
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 0e8762f..f9ed272 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -8,6 +8,7 @@
+ #include "elf.h"
+ 
+ static int loadseg(pde_t *pgdir, uint64 addr, struct inode *ip, uint offset, uint sz);
++void SigToDFL(struct proc *p);
+ 
+ int
+ exec(char *path, char **argv)
+@@ -21,6 +22,7 @@ exec(char *path, char **argv)
+   pagetable_t pagetable = 0, oldpagetable;
+   struct proc *p = myproc();
+ 
++  SigToDFL(p);
+   begin_op();
+ 
+   if((ip = namei(path)) == 0){
+@@ -114,7 +116,7 @@ exec(char *path, char **argv)
+   p->sz = sz;
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
+-  proc_freepagetable(oldpagetable, oldsz);
++  proc_freepagetable(oldpagetable, oldsz);  
+ 
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+@@ -155,3 +157,13 @@ loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz
+   
+   return 0;
+ }
++
++void SigToDFL(struct proc *p){
++  //q2 When using exec, we will return all custom signal handlers tothe default, 
++  //note that SIG_IGN and SIG_DFL should be kept.
++  for (int i = 0 ; i < 32 ; i++){
++    if (p->Signal_Handlers[i]!= ((void*)SIG_IGN))
++      p->Signal_Handlers[i] = ((void*)SIG_DFL);
++  }
++  return;
++}
+\ No newline at end of file
+diff --git a/kernel/param.h b/kernel/param.h
+index b5fdcb2..4b8582e 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -11,3 +11,9 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       1000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
++
++#define SIG_DFL 0 /* default signal handling */
++#define SIG_IGN 1 /* ignore signal */
++#define SIGKILL 9
++#define SIGSTOP 17
++#define SIGCONT 19
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..b60f7bd 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,10 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "stdint.h"
++#include "syscall.h"
++#include "stat.h"
++#include "stdint.h"
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -14,7 +18,7 @@ struct proc *initproc;
+ 
+ int nextpid = 1;
+ struct spinlock pid_lock;
+-
++struct spinlock sempahore_lock;
+ extern void forkret(void);
+ static void freeproc(struct proc *p);
+ 
+@@ -50,6 +54,7 @@ procinit(void)
+   
+   initlock(&pid_lock, "nextpid");
+   initlock(&wait_lock, "wait_lock");
++  initlock(&sempahore_lock, "sempahore lock");
+   for(p = proc; p < &proc[NPROC]; p++) {
+       initlock(&p->lock, "proc");
+       p->kstack = KSTACK((int) (p - proc));
+@@ -127,6 +132,27 @@ found:
+     return 0;
+   }
+ 
++  // An empty user page table.
++  p->pagetable = proc_pagetable(p);
++  if(p->pagetable == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++  //q2
++  // Allocate a trapframe page.
++  if((p->User_Trap_Frame_Backup = (struct trapframe *)kalloc()) == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++  // for (int i = 0 ; i <32; i++ ){
++  //   if ((p->masks[i] =(struct sigaction *)kalloc())== 0){
++  //     freeproc(p);
++  //     release(&p->lock);
++  //     return 0; ;  
++  //   }
++  // }
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+@@ -152,6 +178,8 @@ freeproc(struct proc *p)
+ {
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
++  if (p->User_Trap_Frame_Backup)
++    kfree((void*)p->User_Trap_Frame_Backup);
+   p->trapframe = 0;
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+@@ -163,6 +191,13 @@ freeproc(struct proc *p)
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
++  p->Signal_Mask = 0;
++  p->Pending_Signals = 0 ;
++  p->stop  = 0;
++  p->signalHandaling = 0 ;
++  p->backup_mask = 0;
++  for(int i = 0 ; i< 32 ; i++)
++    p->Signal_Handlers[i] = ((void*)SIG_DFL);
+   p->state = UNUSED;
+ }
+ 
+@@ -244,6 +279,16 @@ userinit(void)
+ 
+   p->state = RUNNABLE;
+ 
++  // added q2
++  for (int i = 0 ; i<32; i ++){
++    p->Signal_Handlers[i] = (void*)SIG_DFL;
++    p->masks[i]= 0;
++  }
++  p->Signal_Mask = SIG_DFL;
++  p->Pending_Signals = SIG_DFL;
++  p->stop = 0;
++  p->signalHandaling = 0 ;
++
+   release(&p->lock);
+ }
+ 
+@@ -315,6 +360,16 @@ fork(void)
+   np->state = RUNNABLE;
+   release(&np->lock);
+ 
++  // q2  it will inherit the parent's signal mask and signal handlers, 
++  //but will not inherit the pending signals.
++  np->stop = 0;
++  np->signalHandaling = 0;
++  np->Signal_Mask = p->Signal_Mask;
++  np->Pending_Signals = SIG_DFL;
++  for (int i =0 ; i<32; i ++)
++    np->Signal_Handlers[i] = p->Signal_Handlers[i];
++
++
+   return pid;
+ }
+ 
+@@ -448,9 +503,6 @@ scheduler(void)
+     for(p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+       if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+         p->state = RUNNING;
+         c->proc = p;
+         swtch(&c->context, &p->context);
+@@ -576,18 +628,12 @@ wakeup(void *chan)
+ // The victim won't exit until it tries to return
+ // to user space (see usertrap() in trap.c).
+ int
+-kill(int pid)
+-{
++kill(int pid, int signum){
+   struct proc *p;
+-
+   for(p = proc; p < &proc[NPROC]; p++){
+     acquire(&p->lock);
+     if(p->pid == pid){
+-      p->killed = 1;
+-      if(p->state == SLEEPING){
+-        // Wake process from sleep().
+-        p->state = RUNNABLE;
+-      }
++      p->Pending_Signals = p->Pending_Signals | 1 << signum;
+       release(&p->lock);
+       return 0;
+     }
+@@ -596,6 +642,7 @@ kill(int pid)
+   return -1;
+ }
+ 
++
+ // Copy to either a user address, or kernel address,
+ // depending on usr_dst.
+ // Returns 0 on success, -1 on error.
+@@ -654,3 +701,1004 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++uint 
++sigprocmask (uint sigmask){
++    struct proc *p = myproc();
++    acquire(&p->lock);
++    uint64 oldMask = p->Signal_Mask;
++    p->Signal_Mask = sigmask; 
++    release (&p->lock);
++    return oldMask; 
++}
++
++int 
++sigaction (int signum, const struct sigaction *act, struct sigaction *oldact){
++  struct proc *p = myproc();
++  void *prevAction;
++  prevAction = p->Signal_Handlers[signum];
++  if (signum == SIGKILL || signum == SIGSTOP )
++    return -1;
++  if (act != 0){ // act non null
++    char c = '0' ; 
++    copyin(p->pagetable, &c , (uint64)act, sizeof (struct sigaction));
++    act  = (struct sigaction *)(intptr_t)&c ; 
++    p->masks[signum] = act->sigmask;
++    p->Signal_Handlers[signum] = act->sa_handler;
++  }
++  if (oldact != 0 ){
++    oldact->sa_handler = prevAction;
++       
++  }
++       
++  return 0;
++}
++
++void
++sigret (void){
++  struct proc *p = myproc();
++  memmove(p->trapframe, p->User_Trap_Frame_Backup, sizeof(struct trapframe));
++  //p->User_Trap_Frame_Backup = 0;
++  p->Signal_Mask = p->backup_mask;
++  p->signalHandaling = 0;
++  return ;
++}
++
++static int semaphores[MAX_BSEM] = {[0 ... MAX_BSEM-1] = -1};
++
++int bsem_alloc()
++{
++    struct proc *p = myproc();
++    acquire(&p->lock);
++    int i;
++    for (i = 0; i < MAX_BSEM; i++)
++    {
++      if (semaphores[i] < 0){
++        semaphores[i] = 1;
++        release(&p->lock);
++        return i;
++      }
++    }
++    release(&p->lock);
++    return -1;
++}
++
++void bsem_free(int i)
++{
++    struct proc *p = myproc();
++    acquire(&p->lock);
++    if (semaphores[i] == 1){
++      semaphores[i] = -1;
++    }
++    release(&p->lock);
++}
++
++void bsem_down(int i)
++{
++    struct proc *p = myproc();
++    if(semaphores[i]==-1){
++      return;
++
++    }
++    if(semaphores[i]==0){
++      acquire(&sempahore_lock);
++      p->semp_hold = i;
++      sleep(&semaphores[i],&sempahore_lock);
++      release(&sempahore_lock);
++  }
++    
++    else{
++    semaphores[i]=0;
++    }
++    
++    
++}
++
++void bsem_up(int i)
++{
++  struct proc *p = myproc();
++  
++	if (semaphores[i] == -1){
++    release(&p->lock);
++		return; 
++    }
++	int counter = 0;
++	for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    counter++;
++		if (p->semp_hold == i)  {
++			p->semp_hold = -1;
++      release(&p->lock);
++      p->state = RUNNABLE;
++			break;
++		}
++    release(&p->lock);
++	}
++	if (counter == NPROC) 
++		semaphores[i] = 1;
++  wakeup(&semaphores[i]); 
++  }
++ /*#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++
++struct cpu cpus[NCPU];
++
++struct proc proc[NPROC];
++
++struct proc *initproc;
++
++int nextpid = 1;
++struct spinlock pid_lock;
++int nexttid = 1;
++struct spinlock tid_lock;
++extern void forkret(void);
++static void freeproc(struct proc *p);
++
++extern char trampoline[]; // trampoline.S
++
++// helps ensure that wakeups of wait()ing
++// parents are not lost. helps obey the
++// memory model when using p->parent.
++// must be acquired before any p->lock.
++struct spinlock wait_lock;
++
++// Allocate a page for each process's kernel stack.
++// Map it high in memory, followed by an invalid
++// guard page.
++void
++proc_mapstacks(pagetable_t kpgtbl) {
++  struct proc *p;
++  struct thread *t;
++  for(p = proc; p < &proc[NPROC]; p++) {
++    for(t = p->threads ; t< &p->threads[NTHREAD]; t++){
++    char *pa = kalloc();
++    if(pa == 0)
++      panic("kalloc");
++    uint64 va = KSTACK((int) (p - proc),(int)(t-p->threads));
++    kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
++    }
++  }
++}
++
++// initialize the proc table at boot time.
++void
++procinit(void)
++{
++  struct proc *p;
++  struct thread *t;
++  initlock(&pid_lock, "nextpid");
++  initlock(&wait_lock, "wait_lock");
++  initlock(&tid_lock,"nexttid");
++  for(p = proc; p < &proc[NPROC]; p++) {
++      initlock(&p->lock, "proc");
++      for(t = p->threads ; t< &p->threads[NTHREAD]; t++){
++      t->kstack = KSTACK((int) (p - proc),(int)(t-p->threads));
++      }
++  }
++}
++
++// Must be called with interrupts disabled,
++// to prevent race with process being moved
++// to a different CPU.
++int
++cpuid()
++{
++  int id = r_tp();
++  return id;
++}
++
++// Return this CPU's cpu struct.
++// Interrupts must be disabled.
++struct cpu*
++mycpu(void) {
++  int id = cpuid();
++  struct cpu *c = &cpus[id];
++  return c;
++}
++
++// Return the current struct proc *, or zero if none.
++struct proc*
++myproc(void) {
++  push_off();
++  struct cpu *c = mycpu();
++  struct proc *p = c->proc;
++  pop_off();
++  return p;
++}
++//------------------------------------
++struct thread*
++mythread(void){             //added to Q3 
++ push_off();
++  struct cpu *c = mycpu();
++  struct thread *t = c->thread;
++  pop_off();
++  return t;
++}
++int
++alloctid(){
++  int tid;
++  acquire(&tid_lock);
++  tid = nexttid;
++  nexttid = nexttid + 1;
++  release(&tid_lock);
++  //printf("alloc tid done \n");
++  return tid;
++}
++//-----------------------------------
++int
++allocpid() {
++  int pid;
++  
++  acquire(&pid_lock);
++  pid = nextpid;
++  nextpid = nextpid + 1;
++  release(&pid_lock);
++
++  return pid;
++}
++static void
++freethread(struct thread *t)
++{
++  //printf("use free thread\n");
++  if(t->trapframe)
++    kfree((void*)t->trapframe);
++  //t->trapframe = 0;
++ // printf("the type is : %s\n", (t->kstack));
++  //kfree((void*)t->kstack);
++  //  t->kstack = 0;
++//  printf("finish kfree\n");
++
++  t->killed = 0;
++  t->tid = 0;
++  t->chan = 0;
++  //t->xstate = 0;
++  t->state = TUNUSED;
++  //printf("finish free thread\n");
++}
++//-----------------------------
++static struct thread*
++allocthread(struct proc *p)
++{
++  struct thread *t;
++
++for(t = p->threads ; t< &p->threads[NTHREAD]; t++){
++  if(t->state == TZOMBIE)
++    freethread(t);
++  if(t->state == TUNUSED)
++  goto found;
++}
++// added release
++  return 0;
++
++found:
++  t->tid = alloctid();
++  t->state = TUSED;
++  //t->killed = 0;
++  if ((t->kstack = (uint64)kalloc()) == 0) {
++      t->state = TUNUSED;
++      return 0;
++    }
++
++  // Set up new context to start executing at forkret,
++  // which returns to user space.
++  memset(&t->context, 0, sizeof(t->context));
++  t->context.ra = (uint64)forkret;
++  t->context.sp = t->kstack + PGSIZE;
++
++  return t;
++}
++
++// free a proc structure and the data hanging from it,
++// including user pages.
++// p->lock must be held.
++
++
++//------------------------
++// Look in the process table for an UNUSED proc.
++// If found, initialize state required to run in the kernel,
++// and return with p->lock held.
++// If there are no free procs, or a memory allocation fails, return 0.
++static struct proc*
++allocproc(void)
++{
++  struct proc *p;
++  struct thread *t;
++  for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->state == UNUSED) {
++      goto found;
++    } else {
++      release(&p->lock);
++    }
++  }
++  return 0;
++
++found:
++  p->pid = allocpid();
++  p->state = USED;
++
++  // Allocate a trapframe page.
++  if((p->start = (struct trapframe *)kalloc()) == 0){ //288
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++  int i = 0;
++  for(t = p->threads; t< &p->threads[NTHREAD]; t++){ 
++     t->trapframe = p->start + sizeof(struct trapframe) * i;
++     t->state = TUNUSED;
++     i++;
++  }
++  // An empty user page table.
++  p->pagetable = proc_pagetable(p);
++  if(p->pagetable == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++
++  return p;
++}
++
++// free a proc structure and the data hanging from it,
++// including user pages.
++// p->lock must be held.
++static void
++freeproc(struct proc *p)
++{
++  if(p->start)
++    kfree((void*)p->start);
++  p->start = 0;
++  if(p->pagetable)
++    proc_freepagetable(p->pagetable, p->sz);
++  p->pagetable = 0;
++  p->sz = 0;
++  p->pid = 0;
++  p->parent = 0;
++  p->name[0] = 0;
++  p->killed = 0;
++  p->xstate = 0;
++  p->state = UNUSED;
++}
++
++// Create a user page table for a given process,
++// with no user memory, but with trampoline pages.
++pagetable_t
++proc_pagetable(struct proc *p)
++{
++  pagetable_t pagetable;
++
++  // An empty page table.
++  pagetable = uvmcreate();
++  if(pagetable == 0)
++    return 0;
++
++  // map the trampoline code (for system call return)
++  // at the highest user virtual address.
++  // only the supervisor uses it, on the way
++  // to/from user space, so not PTE_U.
++  if(mappages(pagetable, TRAMPOLINE, PGSIZE,
++              (uint64)trampoline, PTE_R | PTE_X) < 0){
++    uvmfree(pagetable, 0);
++    return 0;
++  }
++
++  // map the trapframe just below TRAMPOLINE, for trampoline.S.
++  if(mappages(pagetable, TRAPFRAME, PGSIZE,
++              (uint64)(p->start), PTE_R | PTE_W) < 0){
++    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++    uvmfree(pagetable, 0);
++    return 0;
++  }
++
++  return pagetable;
++}
++
++// Free a process's page table, and free the
++// physical memory it refers to.
++void
++proc_freepagetable(pagetable_t pagetable, uint64 sz)
++{
++  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++  uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmfree(pagetable, sz);
++}
++
++// a user program that calls exec("/init")
++// od -t xC initcode
++uchar initcode[] = {
++  0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02,
++  0x97, 0x05, 0x00, 0x00, 0x93, 0x85, 0x35, 0x02,
++  0x93, 0x08, 0x70, 0x00, 0x73, 0x00, 0x00, 0x00,
++  0x93, 0x08, 0x20, 0x00, 0x73, 0x00, 0x00, 0x00,
++  0xef, 0xf0, 0x9f, 0xff, 0x2f, 0x69, 0x6e, 0x69,
++  0x74, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00
++};
++
++// Set up first user process.
++void
++userinit(void)
++{
++  struct proc *p;
++  struct thread *t;
++  p = allocproc();
++  t = allocthread(p);
++  initproc = p;
++  
++  // allocate one user page and copy init's instructions
++  // and data into it.
++  uvminit(p->pagetable, initcode, sizeof(initcode));
++  p->sz = PGSIZE;
++
++  // prepare for the very first "return" from kernel to user.
++  t->trapframe->epc = 0;      // user program counter // not sure
++  t->trapframe->sp = PGSIZE;  // user stack pointer
++
++  safestrcpy(p->name, "initcode", sizeof(p->name));
++  p->cwd = namei("/");
++
++  p->state = RUNNABLE;
++  t->state = TRUNNABLE;
++ // printf("thread %d allocated in proc %d\n", t->tid,p->pid);
++ // printf("main thread state is %d:\n", t->state);
++  release(&p->lock);
++}
++
++// Grow or shrink user memory by n bytes.
++// Return 0 on success, -1 on failure.
++int
++growproc(int n)
++{
++  uint sz;
++  struct proc *p = myproc();
++  acquire(&p->lock);
++  sz = p->sz;
++  if(n > 0){
++    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
++      return -1;
++    }
++  } else if(n < 0){
++    sz = uvmdealloc(p->pagetable, sz, sz + n);
++  }
++  p->sz = sz;
++  release(&p->lock);
++  return 0;
++}
++
++// Create a new process, copying the parent.
++// Sets up child kernel stack to return as if from fork() system call.
++int
++fork(void)
++{
++//  printf("fork? \n");
++  int i, pid;
++  struct proc *np;
++  struct proc *p = myproc();
++  struct thread *t = mythread();
++  struct thread *nt;
++  // Allocate process.
++  if((np = allocproc()) == 0){
++    return -1;
++  }
++ if((nt = allocthread(np)) == 0){
++    return -1;
++  }
++  // Copy user memory from parent to child.
++  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
++    freeproc(np);
++    release(&np->lock);
++    return -1;
++  }
++  np->sz = p->sz;
++
++  // copy saved user registers.
++  *(nt->trapframe) = *(t->trapframe);
++
++  // Cause fork to return 0 in the child.
++  nt->trapframe->a0 = 0;
++
++  // increment reference counts on open file descriptors.
++  for(i = 0; i < NOFILE; i++)
++    if(p->ofile[i])
++      np->ofile[i] = filedup(p->ofile[i]);
++  np->cwd = idup(p->cwd);
++
++  safestrcpy(np->name, p->name, sizeof(p->name));
++
++  pid = np->pid;
++  np->state = RUNNABLE;
++
++  release(&np->lock);
++
++  acquire(&wait_lock);
++  np->parent = p;
++  release(&wait_lock);
++
++  acquire(&np->lock);
++  nt->state =TRUNNABLE;
++  release(&np->lock);
++ // printf("finish fork\n");
++  return pid;
++}
++
++// Pass p's abandoned children to init.
++// Caller must hold wait_lock.
++void
++reparent(struct proc *p)
++{
++  struct proc *pp;
++
++  for(pp = proc; pp < &proc[NPROC]; pp++){
++    if(pp->parent == p){
++      pp->parent = initproc;
++      wakeup(initproc);
++    }
++  }
++}
++void
++exit_thread(int status)
++{
++   struct thread *t;
++  struct thread *currthread = mythread();
++  struct proc *currproc = myproc();
++
++  int islast = 1;
++ for (t = currproc->threads; t < &currproc->threads[NTHREAD]; t++) {
++    if (t != currthread && t->state != TUNUSED && t->state != TZOMBIE) {
++      islast = 0;
++      if (islast && currproc->state != ZOMBIE) {
++        release(&currproc->lock);
++        exit(status);
++      }
++    }
++  }
++  if (islast && currproc->state != ZOMBIE) {
++    release(&currproc->lock);
++    exit(status);
++  }
++  currthread->state = TZOMBIE;
++  for (t = curproc->threads; t < &curproc->threads[NTHREAD]; t++) {
++    if (t->state == TSLEEPING && t->chan == currthread) {
++      t->state = TRUNNABLE;
++    }
++  }
++}
++
++void
++exit(int status)
++{
++  struct proc *p = myproc();
++  struct thread *t = mythread();
++  struct thread *_t;
++ // printf("some one called exit with exit status %d\n", status);
++  if(p == initproc){
++    panic("init exiting");
++  }
++
++  // Close all open files.
++  for(int fd = 0; fd < NOFILE; fd++){
++    if(p->ofile[fd]){
++      struct file *f = p->ofile[fd];
++      fileclose(f);
++      p->ofile[fd] = 0;
++    }
++  }
++
++  begin_op();
++  iput(p->cwd);
++  end_op();
++  p->cwd = 0;
++  acquire(&p->lock);
++    issDead:
++ // tell other thread to kill themselves and also kill the currthread
++  for (_t = p->threads; _t < &p->threads[NTHREAD]; _t++) {
++    if (_t->state != TUNUSED)
++      _t->killed = 1;
++          if (_t->state == TSLEEPING) {
++      _t->state = TRUNNABLE;
++    }
++  }
++  // check if all the other threads are dead and only then continue
++  for(_t = p->threads; _t < &p->threads[NTHREAD]; _t++){
++    if(_t!=t && _t->state != TUNUSED && _t->state != TZOMBIE)
++      goto issDead; //other thread are not dead yet so go check again
++  }
++  release(&p->lock);
++  
++  acquire(&wait_lock);
++  // Give any children to init.
++  reparent(p);
++
++  // Parent might be sleeping in wait().
++  wakeup(p->parent);
++  
++  acquire(&p->lock);
++
++  p->xstate = status;
++  p->state = ZOMBIE;
++  t->xstate = status;
++  exit_thread(status);
++  release(&wait_lock);
++  // Jump into the scheduler, never to return.
++  sched();
++  panic("zombie exit");
++}
++
++// Wait for a child process to exit and return its pid.
++// Return -1 if this process has no children.
++int
++wait(uint64 addr)
++{
++ // printf("wait? \n");
++  struct proc *np;
++  int havekids, pid;
++  struct proc *p = myproc();
++ // struct thread *t;
++  acquire(&wait_lock);
++
++  for(;;){
++    // Scan through table looking for exited children.
++    havekids = 0;
++    for(np = proc; np < &proc[NPROC]; np++){
++      if(np->parent == p){
++        // make sure the child isn't still in exit() or swtch().
++        acquire(&np->lock);
++
++        havekids = 1;
++        if(np->state == ZOMBIE){
++         
++          for(t = p->threads; t < &p->threads[NTHREAD]; t++){ 
++            if(t->state!=TUNUSED){
++              freethread(t);
++              printf("waited\n");
++            }
++          }
++          // Found one.
++          pid = np->pid;
++          if(addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate,
++                                  sizeof(np->xstate)) < 0) {
++            release(&np->lock);
++            release(&wait_lock);
++            return -1;
++          }
++          release(&np->lock);
++          release(&wait_lock);
++          return pid;
++        }
++        release(&np->lock);
++      }
++    }
++
++    // No point waiting if we don't have any children.
++    if(!havekids || p->killed){
++      release(&wait_lock);
++      return -1;
++    }
++    
++    // Wait for a child to exit.
++    //printf("before sleep in wait \n");
++    sleep(p, &wait_lock);  //DOC: wait-sleep
++  }
++}
++
++// Per-CPU process scheduler.
++// Each CPU calls scheduler() after setting itself up.
++// Scheduler never returns.  It loops, doing:
++//  - choose a process to run.
++//  - swtch to start running that process.
++//  - eventually that process transfers control
++//    via swtch back to the scheduler.
++void
++scheduler(void)
++{
++//  printf("in shceduler now \n");
++  struct proc *p;
++  struct cpu *c = mycpu();
++  struct thread *t;
++  c->proc = 0;
++  for(;;){
++    // Avoid deadlock by ensuring that devices can interrupt.
++    intr_on();
++
++    for(p = proc; p < &proc[NPROC]; p++) {
++     // printf("proc number %d and the xstate is %d\n", p->pid,p->xstate);
++      acquire(&p->lock);
++       for(t = p->threads; t < &p->threads[NTHREAD]; t++){
++         if(t->state == TRUNNABLE){
++      //  printf("thread number %d in proc %d and the state is %d\n", t->tid,p->pid,t->state);
++       // Switch to chosen process.  It is the process's job
++        // to release its lock and then reacquire it
++        // before jumping back to us.
++        //p->state = USED;
++        t->state = TRUNNING;
++        // printf("thread number %d and the state is %d\n", t->tid,t->state);
++        c->proc = p;
++        c->thread = t;
++        swtch(&c->context, &t->context);
++      //printf("thread number %d and the state is %d\n", t->tid,t->state);
++        // Process is done running for now.
++        // It should have changed its p->state before coming back.
++        c->proc = 0;
++        c->thread = 0;
++         }
++       }
++      release(&p->lock);
++   //   printf("proc id %d\n", p->pid);
++    }
++   // printf("after for  \n");
++  }
++}
++
++// Switch to scheduler.  Must hold only p->lock
++// and have changed proc->state. Saves and restores
++// intena because intena is a property of this
++// kernel thread, not this CPU. It should
++// be proc->intena and proc->noff, but that would
++// break in the few places where a lock is held but
++// there's no process.
++void
++sched(void)
++{
++  //printf("now in sched()\n");
++  int intena;
++  struct proc *p = myproc();
++  struct thread *t = mythread();
++ // printf("going to sched in thread : %d, his state: %d \n", t->tid,t->state);
++  // printf("thread number %d and the state is %d\n", t->tid,t->state);
++  if(!holding(&p->lock))
++    panic("sched p->lock");
++  if(mycpu()->noff != 1)
++    panic("sched locks");
++  if(t->state == TRUNNING)
++    panic("sched running");
++  if(intr_get())
++    panic("sched interruptible");
++
++  intena = mycpu()->intena;
++  swtch(&t->context, &mycpu()->context);
++  mycpu()->intena = intena;
++ //printf("finish in sched()\n");
++}
++
++// Give up the CPU for one scheduling round.
++void
++yield(void)
++{
++  struct proc *p = myproc();
++  acquire(&p->lock);
++  //p->state = RUNNABLE;
++  mythread()->state =TRUNNABLE;
++  sched();
++  release(&p->lock);
++}
++
++// A fork child's very first scheduling by scheduler()
++// will swtch to forkret.
++void
++forkret(void)
++{
++ // printf("forkret\n");
++  static int first = 1;
++
++  // Still holding p->lock from scheduler.
++  release(&myproc()->lock);
++
++  if (first) {
++    // File system initialization must be run in the context of a
++    // regular process (e.g., because it calls sleep), and thus cannot
++    // be run from main().
++    first = 0;
++    fsinit(ROOTDEV);
++  }
++  //printf("get before usertrapret forkret\n");
++  usertrapret();
++ // printf("finish forkret\n");
++}
++
++// Atomically release lock and sleep on chan.
++// Reacquires lock when awakened.
++void
++sleep(void *chan, struct spinlock *lk)
++{
++  //printf("now we in sleep\n");
++  struct proc *p = myproc();
++  struct thread *t = mythread();
++  // Must acquire p->lock in order to
++  // change p->state and then call sched.
++  // Once we hold p->lock, we can be
++  // guaranteed that we won't miss any wakeup
++  // (wakeup locks p->lock),
++  // so it's okay to release lk.
++
++  acquire(&p->lock);  //DOC: sleeplock1
++  release(lk);
++
++  // Go to sleep.
++  t->chan = chan;
++  t->state = TSLEEPING;
++  
++ //printf("thread number %d and the state is %d\n", t->tid,t->state);
++  sched();
++
++  // Tidy up.
++  t->chan = 0;
++
++  // Reacquire original lock.
++  release(&p->lock);
++  acquire(lk);
++}
++
++// Wake up all processes sleeping on chan.
++// Must be called without any p->lock.
++void
++wakeup(void *chan)
++{
++  struct proc *p;
++  struct  thread *t;
++  
++  for(p = proc; p < &proc[NPROC]; p++) {
++    if(p != myproc()){
++      acquire(&p->lock);
++      for(t = p->threads; t< &p->threads[NTHREAD]; t++){
++        if(t->state == TSLEEPING && t->chan == chan)
++            t->state = TRUNNABLE;
++    }
++      release(&p->lock);
++    }
++  }
++}
++
++// Kill the process with the given pid.
++// The victim won't exit until it tries to return
++// to user space (see usertrap() in trap.c).
++int
++kill(int pid)
++{
++//printf("kill\n");
++  struct proc *p;
++  struct thread *t;
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    if(p->pid == pid){
++      p->killed = 1;
++       for(t = p->threads; t< &p->threads[NTHREAD]; t++){
++          t->killed = 1;
++          if(t->state == TSLEEPING)
++            t->state = TRUNNABLE;
++        }
++      
++      release(&p->lock);
++      return 0;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
++
++// Copy to either a user address, or kernel address,
++// depending on usr_dst.
++// Returns 0 on success, -1 on error.
++int
++either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
++{
++  struct proc *p = myproc();
++  if(user_dst){
++    return copyout(p->pagetable, dst, src, len);
++  } else {
++    memmove((char *)dst, src, len);
++    return 0;
++  }
++}
++
++// Copy from either a user address, or kernel address,
++// depending on usr_src.
++// Returns 0 on success, -1 on error.
++int
++either_copyin(void *dst, int user_src, uint64 src, uint64 len)
++{
++  struct proc *p = myproc();
++  if(user_src){
++    return copyin(p->pagetable, dst, src, len);
++  } else {
++    memmove(dst, (char*)src, len);
++    return 0;
++  }
++}
++
++// Print a process listing to console.  For debugging.
++// Runs when user types ^P on console.
++// No lock to avoid wedging a stuck machine further.
++void
++procdump(void)
++{
++  static char *states[] = {
++  [UNUSED]    "unused",
++ // [SLEEPING]  "sleep ",
++  [RUNNABLE]  "runble",
++  //[RUNNING]   "run   ",
++  [ZOMBIE]    "zombie"
++  };
++  struct proc *p;
++  char *state;
++
++  printf("\n");
++  for(p = proc; p < &proc[NPROC]; p++){
++    if(p->state == UNUSED)
++      continue;
++    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
++      state = states[p->state];
++    else
++      state = "???";
++    printf("%d %s %s", p->pid, state, p->name);
++    printf("\n");
++  }
++}
++
++int
++kthread_create ( void ( *start_func ) ( ) , void *stack ) {
++struct thread *t =mythread();
++struct proc *p = myproc();
++struct thread *_t;
++if ((_t = allocthread(p)) == 0) 
++        return -1;
++*(_t->trapframe) = *(t->trapframe);
++
++  _t->trapframe -> sp = (uint64) stack + MAX_STACK_SIZE - 16;  
++  _t->trapframe -> epc = (uint64) start_func;
++  _t->state = TRUNNABLE;
++  return _t->tid;
++}
++
++int
++kthread_id(){
++struct thread *t = mythread();
++if(t==0)
++return -1;
++return t->tid;
++
++}
++void
++kthread_exit(int status)
++{
++  acquire(&myproc()->lock);
++  exit_thread(status);
++
++// Jump into the scheduler, never to return.
++sched();
++panic("kthread exit: should never get here");
++}
++
++int
++kthread_join(int thread_id, int* status){
++struct thread *t;
++struct proc *p;
++for(p = proc; p < &proc[NPROC]; p++) {
++  if (p->state == UNUSED)
++      continue;
++for(t = p->threads; t< &p->threads[NTHREAD]; t++){
++  if (t->tid == thread_id)
++      goto found;
++    }
++   } 
++return -1;
++   
++   found:
++
++ while (t->state != TZOMBIE && t->state!=TUNUSED) //TODO: check is it's sleeping
++    sleep(t, &wait_lock);
++
++
++  // after the thread became zombie we clean it (the thread the we have been waiting for)
++  if (t->state == TZOMBIE) {
++     *status = t->xstate;
++    freethread(t);
++  }
++
++  return 0;
++}*/
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 8e90008..46e315b 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -1,3 +1,4 @@
++#define MAX_BSEM 128
+ // Saved registers for kernel context switches.
+ struct context {
+   uint64 ra;
+@@ -28,6 +29,8 @@ struct cpu {
+ 
+ extern struct cpu cpus[NCPU];
+ 
++//added q2
++ struct sigaction;
+ // per-process data for the trap handling code in trampoline.S.
+ // sits in a page by itself just under the trampoline page in the
+ // user page table. not specially mapped in the kernel page table.
+@@ -105,4 +108,102 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  // added q2
++  uint32 Pending_Signals;
++  uint32 Signal_Mask; 
++  uint32 backup_mask;
++  void* Signal_Handlers[32];
++  struct trapframe * User_Trap_Frame_Backup;
++  int stop; 
++  uint masks[32];
++  int signalHandaling ;
++   // Q4 
++  int semp_hold;
++};
++/////////////////////// threads 
++/*#define NTHREAD 8
++#define MAX_STACK_SIZE 4000
++// Saved registers for kernel context switches.
++struct context {
++  uint64 ra;
++  uint64 sp;
++
++  // callee-saved
++  uint64 s0;
++  uint64 s1;
++  uint64 s2;
++  uint64 s3;
++  uint64 s4;
++  uint64 s5;
++  uint64 s6;
++  uint64 s7;
++  uint64 s8;
++  uint64 s9;
++  uint64 s10;
++  uint64 s11;
++};
++
++// Per-CPU state.
++struct cpu {
++  struct proc *proc;          // The process running on this cpu, or null.
++  struct context context;     // swtch() here to enter scheduler().
++  int noff;                   // Depth of push_off() nesting.
++  int intena;                 // Were interrupts enabled before push_off()?
++  struct thread *thread;     // the thread running on this cpu, or null. // Q3
++};
++
++extern struct cpu cpus[NCPU];
++
++// per-process data for the trap handling code in trampoline.S.
++// sits in a page by itself just under the trampoline page in the
++// user page table. not specially mapped in the kernel page table.
++// the sscratch register points here.
++// uservec in trampoline.S saves user registers in the trapframe,
++// then initializes registers from the trapframe's
++// kernel_sp, kernel_hartid, kernel_satp, and jumps to kernel_trap.
++// usertrapret() and userret in trampoline.S set up
++// the trapframe's kernel_*, restore user registers from the
++// trapframe, switch to the user page table, and enter user space.
++// the trapframe includes callee-saved user registers like s0-s11 because the
++// return-to-user path via usertrapret() doesn't return through
++// the entire kernel call stack.
++
++enum threadstate { TUNUSED, TUSED, TSLEEPING, TRUNNABLE, TRUNNING, TZOMBIE };
++struct thread{
++int tid;
++struct trapframe *trapframe; // data page for trampoline.S
++enum threadstate state;    // thread state
++struct context context;     // to switch threads
++int killed;                 //If non-zero, have been killed
++void *chan;                  // If non-zero, sleeping on chan
++uint64 kstack;              // Virtual address of kernel stack
++int xstate;                  // Exit status
++};
++
++enum procstate { UNUSED,USED,RUNNABLE,ZOMBIE};
++
++// Per-process state
++struct proc {
++  struct spinlock lock;
++
++  // p->lock must be held when using these:
++  enum procstate state;        // Process state
++  int killed;                  // If non-zero, have been killed
++  int xstate;                  // Exit status to be returned to parent's wait
++  int pid;                     // Process ID
++  uint64 kstack;
++  // proc_tree_lock must be held when using this:
++  struct proc *parent;         // Parent process
++
++  // these are private to the process, so p->lock need not be held.
++  uint64 sz;                   // Size of process memory (bytes)
++  pagetable_t pagetable;       // User page table
++  struct trapframe * start;
++  struct context context;      // swtch() here to run process
++  struct file *ofile[NOFILE];  // Open files
++  struct inode *cwd;           // Current directory
++  char name[16];               // Process name (debugging)
++  struct thread threads[NTHREAD]; // threads in curr proc ( max 8) // added to Q3
+ };
++*/
+\ No newline at end of file
+diff --git a/kernel/stat.h b/kernel/stat.h
+index 19543af..cc21629 100644
+--- a/kernel/stat.h
++++ b/kernel/stat.h
+@@ -9,3 +9,9 @@ struct stat {
+   short nlink; // Number of links to file
+   uint64 size; // Size of file in bytes
+ };
++
++
++struct sigaction {
++    void (*sa_handler) (int);
++    uint sigmask;
++ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..48a06ad 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -6,6 +6,7 @@
+ #include "proc.h"
+ #include "syscall.h"
+ #include "defs.h"
++#include "stdint.h"
+ 
+ // Fetch the uint64 at addr from the current process.
+ int
+@@ -104,6 +105,19 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_sigprocmask(void);
++extern uint64 sys_sigaction(void);
++extern uint64 sys_sigret (void);
++//Q4
++extern uint64 sys_bsem_alloc(void);
++extern uint64 sys_bsem_free(void);
++extern uint64 sys_bsem_down(void);
++extern uint64 sys_bsem_up(void);
++/*extern uint64 sys_kthread_create(void);
++extern uint64 sys_kthread_id(void);
++extern uint64 sys_kthread_exit(void);
++extern uint64 sys_kthread_join(void);
++*/
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +141,19 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigprocmask]   sys_sigprocmask,
++[SYS_sigaction]   sys_sigaction,
++[SYS_sigret]   sys_sigret,
++[SYS_bsem_alloc]    sys_bsem_alloc,
++[SYS_bsem_free]     sys_bsem_free,
++[SYS_bsem_down]     sys_bsem_down,
++[SYS_bsem_up]       sys_bsem_up,
++/*[SYS_kthread_create]  sys_kthread_create,
++[SYS_kthread_id]  sys_kthread_id,
++[SYS_kthread_exit]  sys_kthread_exit,
++[SYS_kthread_join]  sys_kthread_join,*/
++
++
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..4edfc3f 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,14 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigprocmask 22
++#define SYS_sigaction 23
++#define SYS_sigret 24
++#define SYS_bsem_alloc 25
++#define SYS_bsem_free 26
++#define SYS_bsem_down 27
++#define SYS_bsem_up 28
++/*#define SYS_kthread_create 22
++#define SYS_kthread_id 23
++#define SYS_kthread_exit 24
++#define SYS_kthread_join 25*/
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..7573299 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -6,6 +6,7 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "stat.h"
+ 
+ uint64
+ sys_exit(void)
+@@ -77,10 +78,11 @@ uint64
+ sys_kill(void)
+ {
+   int pid;
+-
++  int signum;
+   if(argint(0, &pid) < 0)
+     return -1;
+-  return kill(pid);
++  argint(1, &signum);  
++  return kill(pid, signum);
+ }
+ 
+ // return how many clock tick interrupts have occurred
+@@ -95,3 +97,103 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++
++// added q2
++uint64
++sys_sigprocmask(void)
++{
++  uint64 newMask ;
++  argaddr(0, &newMask);
++  return sigprocmask(newMask);
++}
++
++uint64
++sys_sigaction(void)
++{
++  uint64 signum;
++  struct sigaction *act;
++  struct sigaction *oldAct;
++  if  ((argaddr(0, &signum) < 0) ||
++      (argaddr(1, (void *)&act)<0) ||
++      (argaddr(2, (void *)&oldAct)<0))
++    return -1;
++return sigaction(signum, act, oldAct);
++}
++
++
++uint64
++sys_sigret(void)
++{
++  sigret();
++  return 0;
++}
++
++uint64
++sys_bsem_alloc(void)
++{
++  return bsem_alloc();
++}
++
++uint64
++sys_bsem_free(void)
++{
++  int i;
++
++  if(argint(0, &i) < 0)
++    return -1;
++  bsem_free(i);
++  return 0;
++}
++
++uint64
++sys_bsem_down(void)
++{
++  int i;
++
++  if(argint(0, &i) < 0)
++    return -1;
++  bsem_down(i);
++  return 0;
++}
++
++uint64
++sys_bsem_up(void)
++{
++  int i;
++
++  if(argint(0, &i) < 0)
++    return -1;
++  bsem_up(i);
++  return 0;
++}
++/*
++uint64 sys_kthread_create(void){
++  void (*start_func)();
++  void *stack;
++  if ((argaddr(0, (void *) &start_func) < 0)||(argaddr(1, (void *) &stack) < 0))
++        return -1;
++   return kthread_create(start_func, stack);   
++}
++
++uint64 sys_kthread_id(void){
++  return kthread_id();
++}
++
++uint64 sys_kthread_exit(void){
++    int status;
++
++  if (argint(0, &status) < 0)
++    return -1;
++  kthread_exit(status);
++  return 0;
++}
++
++uint64 sys_kthread_join(void){
++  int id;
++  int *status;
++  if ((argint(0, &id) < 0)||(argaddr(1,(void*)&status)<0))
++    return -1;
++  return kthread_join(id,status);
++}
++*/
+\ No newline at end of file
+diff --git a/kernel/trampoline.S b/kernel/trampoline.S
+index fabaaf9..1396f37 100644
+--- a/kernel/trampoline.S
++++ b/kernel/trampoline.S
+@@ -139,3 +139,12 @@ userret:
+         # return to user mode and user pc.
+         # usertrapret() set up sstatus and sepc.
+         sret
++
++
++.globl sr_start
++.globl sr_end
++
++sr_start:
++    li a7 , 24                
++    ecall
++sr_end:
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..7d3871b 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -5,6 +5,15 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "stdint.h"
++#define USER 1
++#define KERNAL 1
++
++extern void* sr_start(void);         
++extern void* sr_end(void);  
++
++void sigHandler(int);      
++void updatePending(int bit,struct proc* p);
+ 
+ struct spinlock tickslock;
+ uint ticks;
+@@ -95,7 +104,7 @@ usertrapret(void)
+   // kerneltrap() to usertrap(), so turn off interrupts until
+   // we're back in user space, where usertrap() is correct.
+   intr_off();
+-
++  sigHandler(KERNAL); 
+   // send syscalls, interrupts, and exceptions to trampoline.S
+   w_stvec(TRAMPOLINE + (uservec - trampoline));
+ 
+@@ -114,13 +123,15 @@ usertrapret(void)
+   x &= ~SSTATUS_SPP; // clear SPP to 0 for user mode
+   x |= SSTATUS_SPIE; // enable interrupts in user mode
+   w_sstatus(x);
+-
++  
++  sigHandler(USER); 
+   // set S Exception Program Counter to the saved user pc.
+   w_sepc(p->trapframe->epc);
+-
++// HERE??
++  
+   // tell trampoline.S the user page table to switch to.
+   uint64 satp = MAKE_SATP(p->pagetable);
+-
++  
+   // jump to trampoline.S at the top of memory, which 
+   // switches to the user page table, restores user registers,
+   // and switches to user mode with sret.
+@@ -218,3 +229,147 @@ devintr()
+   }
+ }
+ 
++void kernalSig(struct proc *p, int sig){
++    printf("kernalSig Handler %d, %d\n", p->pid, sig);
++  return;
++}
++
++void call_sigret(){
++  sigret();
++}
++
++int
++Kill(struct proc* p) {
++  //printf("handle kill\n");
++  p->killed=1;
++  if(p->state == SLEEPING){
++          // Wake process from sleep().
++          p->state = RUNNABLE;
++        }
++  return 0;
++}
++
++
++int 
++Stop(struct proc* p){
++  //printf("handle stop\n");
++  if((p->state==RUNNING || p->state==RUNNABLE) && !p->stop){
++    p->stop=1;
++    int stop = 1;
++    while(stop){
++     // printf("handle stop %d\n", p->Pending_Signals);
++      if((p->Pending_Signals) & 1<<SIGKILL){
++       // printf("handle stop\n");
++        Kill(p);
++        updatePending( SIGKILL, p);
++        break;
++      }
++      if(((p->Pending_Signals) & 1<<SIGCONT)==0){
++        yield();
++        //printf("");
++      }
++      else{
++        p->stop=0;
++        updatePending(SIGCONT,p);
++        stop=0;
++        break;
++      }
++    }
++    return 0;
++  }
++  return -1;
++}
++
++int 
++Cont(struct proc* p ){
++  //printf("handle cont\n");
++  if(p->stop){
++    p->stop=0;
++    return 0;
++  }
++  return -1;
++}
++
++
++void updatePending(int bit,struct proc* p){
++    //printf("turn off bit: %d %d\n ", bit, p->Pending_Signals);
++    p->Pending_Signals ^=1UL << bit; 
++    //printf("turn off bit: %d %d\n ", bit, p->Pending_Signals);
++}
++
++void handleUserSignal(struct proc* p,int signum){
++  uint64 srSize = sr_end - sr_start;
++  uint64 tpSize = sizeof(struct trapframe);
++  //back up the process "general" signal mask  
++  p->backup_mask  = p->Signal_Mask; 
++  p->Signal_Mask = p->masks[signum];
++  //indicate that the process is at "signal handling"  
++  p->signalHandaling = 1;
++  //copy the current process trapframe, to the trapframe backup stack pointer
++  //(to reduce its stack pointer at the user space).
++  memmove(p->User_Trap_Frame_Backup, p->trapframe,tpSize );
++  //update the current process trapframe "saved user pc" 
++  //to point to the signal handler function address
++  p->trapframe->epc = (uint64)(p->Signal_Handlers[signum]);
++  
++  //reduce the trapframe stack pointer by this function (X) length 
++  p->trapframe->sp -= srSize;
++  uint backup_sp = p->trapframe->sp;
++  copyout(p->pagetable, (uint64)p->trapframe->sp, (char*)&sr_start, srSize);
++  
++  //put at the process a0 register the signal number (for the signal handling call), 
++  //and at the process return address register the "new" trapframe stack pointer
++  p->trapframe->a0 = signum;
++  p->trapframe->ra = backup_sp;
++  updatePending (signum, p);
++  return;
++}
++
++void sigHandler (int stat){
++  struct proc *p = myproc(); 
++  if(p!=0){
++    // handling sig or has no sinals pending return
++    if(p->signalHandaling || !p->Pending_Signals){
++      return;
++    }
++    // run over all sigs
++    for(int i=0;i<32;++i){
++      if (1<<SIGKILL & p->Pending_Signals){
++        Kill(p);
++        updatePending(SIGKILL,p);
++      }
++      if (1<<SIGSTOP& p->Pending_Signals){
++        Stop(p);
++        updatePending(SIGSTOP,p);
++      }
++      if((1<<i&p->Pending_Signals) && !((1<<i)&p->Signal_Mask)){
++        if(p->Signal_Handlers[i]==(void*)SIG_IGN)
++          continue;
++        if((i == SIGCONT)||
++          (p->Signal_Handlers[i]==(void*)SIG_DFL)||
++          (p->Signal_Handlers[i]==(void*)SIGSTOP)||
++          (p->Signal_Handlers[i]==(void*)SIGCONT)||
++          (p->Signal_Handlers[i]==(void*)SIGKILL)){ //kernel
++          if(stat == KERNAL){
++            //printf("kernal sig %d\n", i);
++            if (i == SIGKILL || (p->Signal_Handlers[i]==(void*)SIGKILL) )
++                Kill(p);
++            else if (i == SIGSTOP || (p->Signal_Handlers[i]==(void*)SIGSTOP)) 
++                Stop(p);
++            else if ((i == SIGCONT && p->Signal_Handlers[i] == (void*)SIG_DFL)|| (p->Signal_Handlers[i]==(void*)SIGCONT))
++                Cont(p);
++            else 
++                Kill(p);
++            updatePending(i,p);
++          }
++        }
++        else if (stat == USER){                                      //user 
++            //printf("user sig %d\n", i);
++            handleUserSignal(p,i);
++            return;
++        }
++      }
++    }
++  }
++  return;
++}
+\ No newline at end of file
+diff --git a/user/Csemaphore.c b/user/Csemaphore.c
+new file mode 100644
+index 0000000..3ece308
+--- /dev/null
++++ b/user/Csemaphore.c
+@@ -0,0 +1,40 @@
++
++#include "user.h"
++#include "Csemaphore.h"
++
++int csem_alloc(struct counting_semaphore *sem,int initial_value) {
++	int semaphore_1 ,semaphore_2;
++     semaphore_1 = bsem_alloc();
++     semaphore_2 = bsem_alloc();
++	if (semaphore_2 == -1 || semaphore_1 == -1)
++		return -1; 
++	sem->semaphore1 = semaphore_1;
++	sem->semaphore2 = semaphore_2;
++	if (initial_value == 0)
++		bsem_down(sem->semaphore2);
++	sem->value = initial_value;
++ 	return 0;
++}
++
++void csem_free(struct counting_semaphore *sem) {
++	bsem_free(sem->semaphore1);
++	bsem_free(sem->semaphore2);
++	free(sem);
++}
++
++void csem_down(struct counting_semaphore *sem) {
++	bsem_down(sem->semaphore2);
++	bsem_down(sem->semaphore1);
++	sem->value--;
++	if (sem->value > 0)
++		bsem_up(sem->semaphore2);
++	bsem_up(sem->semaphore1);
++}
++
++void csem_up (struct counting_semaphore *sem) {
++	bsem_down(sem->semaphore1);
++	sem->value++;
++	if (sem->value == 1)
++		bsem_up(sem->semaphore2);
++	bsem_up(sem->semaphore1);
++}
+\ No newline at end of file
+diff --git a/user/Csemaphore.h b/user/Csemaphore.h
+new file mode 100644
+index 0000000..1e46f32
+--- /dev/null
++++ b/user/Csemaphore.h
+@@ -0,0 +1,11 @@
++
++struct counting_semaphore {
++	int semaphore1;
++	int semaphore2;
++	int value;
++};
++
++int csem_alloc(struct counting_semaphore *,int);
++void csem_free(struct counting_semaphore *sem);
++void csem_down(struct counting_semaphore *sem);
++void csem_up(struct counting_semaphore *sem);
+\ No newline at end of file
+diff --git a/user/bsem_test.c b/user/bsem_test.c
+new file mode 100644
+index 0000000..71642b9
+--- /dev/null
++++ b/user/bsem_test.c
+@@ -0,0 +1,52 @@
++#include "kernel/types.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++#include "kernel/param.h"
++
++void func1(int s1, int s2){
++    printf("S1\n");
++    bsem_up(s2);
++    printf("S5\n");
++    bsem_up(s2);
++    printf("S8\n");
++    printf("S9\n");
++    bsem_down(s1);
++    printf("S7\n");
++    bsem_up(s2);
++}   
++
++void func2(int s1, int s2){
++    bsem_down(s2);
++    printf("S2\n");
++    printf("S3\n");
++    bsem_down(s2);
++    printf("S6\n");
++    bsem_up(s1);
++    bsem_down(s2);
++    printf("S4\n");
++    bsem_up(s2);
++}
++
++int main(){
++    int s1 = bsem_alloc();
++    int s2 = bsem_alloc();
++    bsem_down(s1);
++    bsem_down(s2);
++    // printf("S1: %d S2: %d\n", s1, s2);
++
++    if (s1 < 0 || s2 < 0){
++        printf("bsem_alloc failed\n");
++    }
++
++    int pid = fork();
++
++    if(pid == 0){
++        func1(s1, s2);
++    }
++    else{
++        func2(s1, s2);
++    }
++    printf("need to print: 1 5 8 9 2 3 6 7 4\n");
++    exit(0);
++}
++
+diff --git a/user/grind.c b/user/grind.c
+index 5cd89f4..bbf3997 100644
+--- a/user/grind.c
++++ b/user/grind.c
+@@ -142,12 +142,12 @@ go(int which_child)
+         printf("grind: chdir failed\n");
+         exit(1);
+       }
+-      kill(pid);
++      kill(pid, SIGKILL);
+       wait(0);
+     } else if(what == 18){
+       int pid = fork();
+       if(pid == 0){
+-        kill(getpid());
++        kill(getpid(), SIGKILL);
+         exit(0);
+       } else if(pid < 0){
+         printf("grind: fork failed\n");
+@@ -324,8 +324,8 @@ iter()
+   int st1 = -1;
+   wait(&st1);
+   if(st1 != 0){
+-    kill(pid1);
+-    kill(pid2);
++    kill(pid1, SIGKILL);
++    kill(pid2, SIGKILL);
+   }
+   int st2 = -1;
+   wait(&st2);
+diff --git a/user/kill.c b/user/kill.c
+index 1b0253b..5c9cb59 100644
+--- a/user/kill.c
++++ b/user/kill.c
+@@ -6,12 +6,16 @@ int
+ main(int argc, char **argv)
+ {
+   int i;
+-
++/*
+   if(argc < 2){
+     fprintf(2, "usage: kill pid...\n");
+     exit(1);
+   }
+   for(i=1; i<argc; i++)
+     kill(atoi(argv[i]));
+-  exit(0);
++*/
++for(i=1; i<argc; i= i +2)
++  kill(atoi(argv[i]),atoi(argv[i+1]));
++
++exit(0);
+ }
+diff --git a/user/test.c b/user/test.c
+new file mode 100644
+index 0000000..f86b74d
+--- /dev/null
++++ b/user/test.c
+@@ -0,0 +1,205 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/fcntl.h"
++#include "user/user.h"
++#define SIG_DFL 0 //default signal handling
++#define SIG_IGN 1 //ignore signal
++#define SIGKILL 9
++#define SIGSTOP 17
++#define SIGCONT 19
++void justForAdrr(){
++    printf("LET THE GAME BEGIN!");}
++
++void H1(int sig)
++{
++    printf( "OK\tH1:\t%d\n", sig);
++}
++void H2(int sig)
++{
++    printf( "OK\tH2:\t%d\n", sig);
++}
++void H3(int sig)
++{
++    printf( "OK\tH3:\t%d\n", sig);
++}
++void H4(int sig)
++{
++    printf( "OK\tH4:\t%d\n", sig);
++}
++
++void tryToChangeKill(int sig)
++{
++    
++    printf( "TEST FAILED! \t%d\n", sig);
++}
++void tryToChangeStop(int sig)
++{
++    printf( "TEST FAILED! \t%d\n", sig);
++}
++
++int main()
++{
++    struct sigaction act0 = {justForAdrr, 2021};
++    sigaction(4, &act0, 0);
++    int ok = 1 ;
++    int fail = 0;
++    // block sig 10 + kill
++    printf("\nTEST 1:\n");
++    ok = 1;
++    if (fork() == 0){
++        struct sigaction act1 = {H3, 1 << SIGKILL};
++        struct sigaction act2 = {H4, 1 << SIGKILL};
++        sigaction(10, &act1, 0);
++        sigaction(11, &act2, 0);
++        sigprocmask((1 << 4) | (1 << SIGKILL));
++        //printf( "1 signal ONLY ! : (10/11)\n");
++        kill(getpid(), 10);
++        kill(getpid(), SIGKILL);
++        kill(getpid(), 11);
++        sleep(7);
++        //SIGKILL  blocked
++        printf( "FAIL\n\n");
++        fail += 1;
++        ok =0 ;
++        exit(0);
++    }
++
++    if (ok) printf("OK\n\n");
++    ok = 1;
++    wait(0);
++     
++   
++    
++    // send 2 signals 
++    printf("\nTEST 2:\n");
++    if (fork() == 0){
++        struct sigaction act1 = {H1, 0};
++        struct sigaction act2 = {H2, 0};
++        sigaction(10, &act1, 0);
++        sigaction(20, &act2, 0);
++        sigprocmask((1 << 10) | (1 << 20));
++        int pid = getpid();
++        kill(pid, 10);
++        kill(pid, 20);
++        sigprocmask(0);
++        kill(pid, 11);
++        printf( "FAIL\n\n");
++        fail+=1;
++        ok = 0;
++        exit(0);
++    }
++    if (ok) printf("OK\n");
++
++    wait(0);
++    
++    printf("\nTEST 3:\n");
++
++    if (fork() == 0){
++        int Fpid = getpid();
++        int pid = fork();
++        if (pid != 0)
++            wait(0);
++        if (pid == 0)
++        {
++            kill(Fpid, SIGSTOP);
++            kill(Fpid, SIGKILL);
++            kill(Fpid, SIGCONT);
++            printf( "OK\tSON exit\n");
++            ok = 0;
++            exit(0);
++        }
++        //FATHER wasn't killed with SIGKILL after SIGSTOP!
++        printf( "FAIL\n\n");
++        fail++;
++        ok = 0 ;
++        exit(0);
++    }
++    if (ok) printf("OK\n");
++
++
++
++    // test user handlers
++    printf("\nTEST 4:\n");
++    if (fork() == 0){
++        struct sigaction act1 = {H1, 0};
++        struct sigaction act2 = {H2, 0};
++        struct sigaction act3 = {(void *)SIGCONT, 0};
++        struct sigaction act4 = {(void *)SIG_IGN, 0};
++        sigaction(10 , &act1, 0);
++        sigaction(20, &act2, 0);
++        sigaction(4, &act3, 0);
++        sigaction(5, &act4, 0);
++        kill(getpid(), 10);
++        kill(getpid(), 4);
++        kill(getpid(), 20);
++        kill(getpid(), 5); 
++        printf( "OK\n\n");
++        kill(getpid(), SIGKILL);    
++        printf( "FAIL\n\n");
++        fail++;
++        exit(0); 
++    }
++    ok = 1 ; 
++   wait(0);
++   /// stop cont
++    printf("\nTEST 5:\n");
++    
++    if (fork() == 0){
++        struct sigaction act1 = {H3, 0};
++        sigaction(5, &act1, 0);
++        sigprocmask(0);
++        kill(getpid(), 5);
++        int Fpid = getpid();
++        int pid = fork();
++        if (pid != 0)
++            sleep(5);
++        if (pid == 0)
++        {
++            kill(Fpid, SIGSTOP);
++            sleep(2);
++            kill(Fpid, SIGCONT);
++            printf( "OK\tSON exit\n");
++            exit(0);
++        }
++        //FATHER exiting
++        printf( "OK\n\n");
++        exit(0);
++    }
++
++    wait(0);
++// kill stoped
++// change KILL, STOP   ; child kill father
++    printf("\nTEST 6:\n");
++    if (fork() == 0){
++        struct sigaction act1 = {tryToChangeKill, 0};
++        struct sigaction act2 = {tryToChangeStop, 0};
++        if ((sigaction(SIGSTOP, &act1, 0)) < 0)
++            printf( "OK\t\n");
++        if ((sigaction(SIGKILL, &act2, 0)) < 0){
++            sleep(2);
++            printf( "OK\t\n");}
++        int Fpid = getpid();
++        if (fork() != 0){
++            kill(getpid(), SIGSTOP);
++        }
++        
++        if (Fpid != getpid()){
++            kill(Fpid, SIGKILL);
++            kill(getpid(),SIGKILL);
++        }
++        //Both should be killed
++        printf( "FAIL\n\n");
++        fail ++;
++        ok =0 ;
++        exit(0); 
++    }
++    if (ok) printf("OK\n\n");
++    wait(0);
++    ok = 1;
++   
++
++    wait(0);     
++    sleep(10);
++    printf("\n --  fail : %d tests --\n", fail);
++    exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index b71ecda..12cb517 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,6 +1,7 @@
+ struct stat;
+ struct rtcdate;
+-
++struct sigaction;
++typedef unsigned int   uint;
+ // system calls
+ int fork(void);
+ int exit(int) __attribute__((noreturn));
+@@ -9,7 +10,7 @@ int pipe(int*);
+ int write(int, const void*, int);
+ int read(int, void*, int);
+ int close(int);
+-int kill(int);
++int kill(int, int);
+ int exec(char*, char**);
+ int open(const char*, int);
+ int mknod(const char*, short, short);
+@@ -23,6 +24,15 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++uint sigprocmask (uint sigmask);
++int sigaction (int signum, const struct sigaction *act, struct sigaction *oldact);
++void sigret (void);
++
++//Q4
++int bsem_alloc();
++void bsem_free(int);
++void bsem_down(int);
++void bsem_up(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usertests.c b/user/usertests.c
+index ba4255b..89338f4 100644
+--- a/user/usertests.c
++++ b/user/usertests.c
+@@ -8,6 +8,12 @@
+ #include "kernel/memlayout.h"
+ #include "kernel/riscv.h"
+ 
++
++#include "kernel/spinlock.h"  // NEW INCLUDE FOR ASS2
++#include "Csemaphore.h"   // NEW INCLUDE FOR ASS 2
++#include "kernel/proc.h"         // NEW INCLUDE FOR ASS 2, has all the signal definitions and sigaction definition.  Alternatively, copy the relevant things into user.h and include only it, and then no need to include spinlock.h .
++
++
+ //
+ // Tests xv6 system calls.  usertests without arguments runs them all
+ // and usertests <name> runs <name> test. The test runner creates for
+@@ -17,10 +23,117 @@
+ // prints "OK".
+ //
+ 
++#define SIGKILL 9
+ #define BUFSZ  ((MAXOPBLOCKS+2)*BSIZE)
+ 
+ char buf[BUFSZ];
+ 
++
++int wait_sig = 0;
++
++void test_handler(int signum){
++    wait_sig = 1;
++    printf("Received sigtest\n");
++}
++/*
++void test_thread(){
++    printf("Thread is now running\n");
++    kthread_exit(0);
++}
++*/
++void signal_test(char *s){
++    int pid;
++    int testsig;
++    testsig=15;
++    struct sigaction act = {test_handler, (uint)(1 << 29)};
++    struct sigaction old;
++
++    sigprocmask(0);
++    sigaction(testsig, &act, &old);
++    if((pid = fork()) == 0){
++        while(!wait_sig)
++            sleep(1);
++        exit(0);
++    }
++    kill(pid, testsig);
++    wait(&pid);
++    printf("Finished testing signals\n");
++}
++/*
++void thread_test(char *s){
++    int tid;
++    int status;
++    void* stack = malloc(STACK_SIZE);
++    tid = kthread_create(test_thread, stack);
++    kthread_join(tid,&status);
++
++    tid = kthread_id();
++    free(stack);
++    printf("Finished testing threads, main thread id: %d, %d\n", tid,status);
++}*/
++
++
++void bsem_test(char *s){
++    int pid;
++    int bid = bsem_alloc();
++    bsem_down(bid);
++    printf("1. Parent downing semaphore\n");
++    if((pid = fork()) == 0){
++        printf("2. Child downing semaphore\n");
++        bsem_down(bid);
++        printf("4. Child woke up\n");
++        exit(0);
++    }
++    sleep(5);
++    printf("3. Let the child wait on the semaphore...\n");
++    sleep(10);
++    bsem_up(bid);
++
++    bsem_free(bid);
++    wait(&pid);
++
++    printf("Finished bsem test, make sure that the order of the prints is alright. Meaning (1...2...3...4)\n");
++}
++
++
++void Csem_test(char *s){
++	struct counting_semaphore csem;
++    int retval;
++    int pid;
++    
++    
++    retval = csem_alloc(&csem,1);
++    if(retval==-1)
++    {
++		printf("failed csem alloc");
++		exit(-1);
++	}
++    csem_down(&csem);
++    printf("1. Parent downing semaphore\n");
++    if((pid = fork()) == 0){
++        printf("2. Child downing semaphore\n");
++        csem_down(&csem);
++        printf("4. Child woke up\n");
++        exit(0);
++    }
++    sleep(5);
++    printf("3. Let the child wait on the semaphore...\n");
++    sleep(10);
++    csem_up(&csem);
++
++    csem_free(&csem);
++    wait(&pid);
++
++    printf("Finished bsem test, make sure that the order of the prints is alright. Meaning (1...2...3...4)\n");
++}
++
++
++
++
++
++
++
++
+ // what if you pass ridiculous pointers to system calls
+ // that read user memory with copyin?
+ void
+@@ -799,7 +912,7 @@ killstatus(char *s)
+       exit(0);
+     }
+     sleep(1);
+-    kill(pid1);
++    kill(pid1, SIGKILL);
+     wait(&xst);
+     if(xst != -1) {
+        printf("%s: status should be -1\n", s);
+@@ -856,9 +969,9 @@ preempt(char *s)
+   }
+   close(pfds[0]);
+   printf("kill... ");
+-  kill(pid1);
+-  kill(pid2);
+-  kill(pid3);
++  kill(pid1, SIGKILL);
++  kill(pid2, SIGKILL);
++  kill(pid3, SIGKILL);
+   printf("wait... ");
+   wait(0);
+   wait(0);
+@@ -914,7 +1027,7 @@ reparent(char *s)
+     } else {
+       int pid2 = fork();
+       if(pid2 < 0){
+-        kill(master_pid);
++        kill(master_pid, SIGKILL);
+         exit(1);
+       }
+       exit(0);
+@@ -2263,7 +2376,7 @@ sbrkfail(char *s)
+   for(i = 0; i < sizeof(pids)/sizeof(pids[0]); i++){
+     if(pids[i] == -1)
+       continue;
+-    kill(pids[i]);
++    kill(pids[i], SIGKILL);
+     wait(0);
+   }
+   if(c == (char*)0xffffffffffffffffL){
+@@ -2766,66 +2879,81 @@ main(int argc, char *argv[])
+     void (*f)(char *);
+     char *s;
+   } tests[] = {
+-    {manywrites, "manywrites"},
+-    {execout, "execout"},
+-    {copyin, "copyin"},
+-    {copyout, "copyout"},
+-    {copyinstr1, "copyinstr1"},
+-    {copyinstr2, "copyinstr2"},
+-    {copyinstr3, "copyinstr3"},
+-    {rwsbrk, "rwsbrk" },
+-    {truncate1, "truncate1"},
+-    {truncate2, "truncate2"},
+-    {truncate3, "truncate3"},
+-    {reparent2, "reparent2"},
+-    {pgbug, "pgbug" },
+-    {sbrkbugs, "sbrkbugs" },
++	  //ASS 2 Compilation tests:
++	  {signal_test,"signal_test"},
++	 // {thread_test,"thread_test"},
++	  {bsem_test,"bsem_test"},
++	  {Csem_test,"Csem_test"},
++	  
++// ASS 1 tests
++//	{stracetest,"stracetest"},    //18 ticks, need to compare inputs
++//	{CombinedPerfPriorityFCFStest,"CombinedPerfPriorityFCFStest"},  //90 ticks, long calculation results: in DEFAULT, averages and stime equal between runs,   in FCFS and SRT(with starting value QUANTUM*100), stime rises with each run (each run waits for all the previous), in CFSD short long short long.
++//	{FCFStest,"FCFStest"},
++//	{priority_intput_validation,"priority_intput_validation"},
++	
++	
++		  
++// xv6 included tests:  // comented out long tests
++ //   {manywrites, "manywrites"},  //800 ticks, too long
++ //   {execout, "execout"}, //1600 ticks, too long
++    {copyin, "copyin"},//5 ticks
++    {copyout, "copyout"},// 0 ticks
++    {copyinstr1, "copyinstr1"},// 0 ticks
++    {copyinstr2, "copyinstr2"},// 1 ticks
++    {copyinstr3, "copyinstr3"},// 0 ticks
++    {rwsbrk, "rwsbrk" },// 3 ticks
++    {truncate1, "truncate1"},// 4 ticks
++    {truncate2, "truncate2"},// 4 ticks
++ //   {truncate3, "truncate3"},// 0 ticks
++//    {reparent2, "reparent2"},// 600 ticks, causes fails in 
++    {pgbug, "pgbug" },// 0 ticks
++   // {sbrkbugs, "sbrkbugs" }, // 1 ticks
+     // {badwrite, "badwrite" },
+-    {badarg, "badarg" },
++    {badarg, "badarg" },// 200 ticks
+     {reparent, "reparent" },
+     {twochildren, "twochildren"},
+     {forkfork, "forkfork"},
+     {forkforkfork, "forkforkfork"},
+-    {argptest, "argptest"},
+-    {createdelete, "createdelete"},
+-    {linkunlink, "linkunlink"},
+-    {linktest, "linktest"},
+-    {unlinkread, "unlinkread"},
+-    {concreate, "concreate"},
+-    {subdir, "subdir"},
+-    {fourfiles, "fourfiles"},
+-    {sharedfd, "sharedfd"},
+-    {dirtest, "dirtest"},
+-    {exectest, "exectest"},
+-    {bigargtest, "bigargtest"},
+-    {bigwrite, "bigwrite"},
+-    {bsstest, "bsstest"},
+-    {sbrkbasic, "sbrkbasic"},
+-    {sbrkmuch, "sbrkmuch"},
+-    {kernmem, "kernmem"},
+-    {sbrkfail, "sbrkfail"},
+-    {sbrkarg, "sbrkarg"},
+-    {validatetest, "validatetest"},
+-    {stacktest, "stacktest"},
+-    {opentest, "opentest"},
+-    {writetest, "writetest"},
+-    {writebig, "writebig"},
+-    {createtest, "createtest"},
+-    {openiputtest, "openiput"},
+-    {exitiputtest, "exitiput"},
+-    {iputtest, "iput"},
+-    {mem, "mem"},
+-    {pipe1, "pipe1"},
+-    {killstatus, "killstatus"},
+-    {preempt, "preempt"},
+-    {exitwait, "exitwait"},
+-    {rmdot, "rmdot"},
+-    {fourteen, "fourteen"},
+-    {bigfile, "bigfile"},
+-    {dirfile, "dirfile"},
+-    {iref, "iref"},
+-    {forktest, "forktest"},
+-    {bigdir, "bigdir"}, // slow
++    {argptest, "argptest"},// 1 ticks
++//    {createdelete, "createdelete"},// 200 ticks
++//    {linkunlink, "linkunlink"},// 80 ticks
++    {linktest, "linktest"},// 9 ticks
++    {unlinkread, "unlinkread"},// 7 ticks
++//    {concreate, "concreate"},// 430 ticks
++    {subdir, "subdir"},// 24 ticks
++    {fourfiles, "fourfiles"},// 26 ticks
++//    {sharedfd, "sharedfd"},// 200 ticks
++    {dirtest, "dirtest"},// 4 ticks
++    {exectest, "exectest"},// 0 ticks
++    {bigargtest, "bigargtest"},//4 ticks
++    {bigwrite, "bigwrite"},// 170 ticks
++    {bsstest, "bsstest"},// 0 ticks
++//    {sbrkbasic, "sbrkbasic"},// 90 ticks
++//    {sbrkmuch, "sbrkmuch"},// 70 ticks
++ //   {kernmem, "kernmem"},// 17 ticks
++//    {sbrkfail, "sbrkfail"},// 300 ticks
++    {sbrkarg, "sbrkarg"},// 4 ticks
++    {validatetest, "validatetest"},// 11 ticks
++  //  {stacktest, "stacktest"},// 0 ticks
++    {opentest, "opentest"},// 1 ticks
++//    {writetest, "writetest"},// 50 ticks
++//    {writebig, "writebig"},// 130 ticks
++//    {createtest, "createtest"},// 200 ticks
++    {openiputtest, "openiput"},// 5 ticks
++    {exitiputtest, "exitiput"},// 5 ticks
++    {iputtest, "iput"},// 4 ticks
++//    {mem, "mem"},// 200 ticks
++    {pipe1, "pipe1"},// 1 ticks
++//    {killstatus, "killstatus"},//150 ticks
++    {preempt, "preempt"},    //doesn't work on FCFS
++    {exitwait, "exitwait"},// 18 ticks
++    {rmdot, "rmdot"},//6 ticks
++    {fourteen, "fourteen"},// 12 ticks
++    {bigfile, "bigfile"},// 12 ticks
++    {dirfile, "dirfile"},// 4 ticks
++//    {iref, "iref"},// 160 ticks
++    {forktest, "forktest"}, // 14 ticks
++//    {bigdir, "bigdir"}, // slow // 3800 ticks
+     { 0, 0},
+   };
+ 
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..4f3d5bc 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,10 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigprocmask");
++entry("sigaction");
++entry("sigret");
++entry("bsem_alloc");
++entry("bsem_free");
++entry("bsem_down");
++entry("bsem_up");
